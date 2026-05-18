@@ -1,1 +1,198 @@
 
+# ============================================
+# IMPORTS
+# ============================================
+import pandas as pd
+import string
+import logging
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.neighbors import NearestNeighbors
+from sklearn.decomposition import TruncatedSVD
+from sklearn.preprocessing import Normalizer
+from sklearn.pipeline import make_pipeline
+
+
+logging.basicConfig(level=logging.INFO)
+
+
+# ============================================
+# CONFIG
+# ============================================
+CONFIG = {
+    "top_k": 3,
+
+    "word_weight": 0.55,
+    "char_weight": 0.25,
+    "lsa_weight": 0.20,
+
+    "lsa_components": 100,
+
+    "high_threshold": 85,
+    "medium_threshold": 70,
+    "review_threshold": 75
+}
+
+
+# ============================================
+# CLEANING FUNCTION
+# ============================================
+def clean_text(text):
+    if pd.isna(text):
+        return ""
+
+    return (
+        str(text)
+        .lower()
+        .strip()
+        .translate(str.maketrans("", "", string.punctuation))
+    )
+
+
+# ============================================
+# CONFIDENCE FUNCTION
+# ============================================
+def get_confidence(score):
+    if score >= CONFIG["high_threshold"]:
+        return "High"
+    elif score >= CONFIG["medium_threshold"]:
+        return "Medium"
+    return "Low"
+
+
+# ============================================
+# UNSUPERVISED MATCHER WITH TF-IDF + KNN + LSA
+# ============================================
+def match_metrics_with_lsa_knn(df):
+    logging.info("Starting unsupervised metric matching...")
+
+    df = df.copy()
+
+    random_clean = df["random_metrics"].apply(clean_text).tolist()
+    reference_clean = df["reference_metrics"].apply(clean_text).tolist()
+
+    # --------------------------------------------
+    # 1. WORD TF-IDF
+    # Captures phrase-level similarity.
+    # --------------------------------------------
+    word_vectorizer = TfidfVectorizer(
+        stop_words="english",
+        ngram_range=(1, 3),
+        sublinear_tf=True
+    )
+
+    ref_word_vec = word_vectorizer.fit_transform(reference_clean)
+    rand_word_vec = word_vectorizer.transform(random_clean)
+
+    word_sim = cosine_similarity(rand_word_vec, ref_word_vec)
+
+    # --------------------------------------------
+    # 2. CHARACTER TF-IDF
+    # Captures abbreviations, typos, plural forms,
+    # and minor naming variations.
+    # --------------------------------------------
+    char_vectorizer = TfidfVectorizer(
+        analyzer="char_wb",
+        ngram_range=(3, 5),
+        sublinear_tf=True
+    )
+
+    ref_char_vec = char_vectorizer.fit_transform(reference_clean)
+    rand_char_vec = char_vectorizer.transform(random_clean)
+
+    char_sim = cosine_similarity(rand_char_vec, ref_char_vec)
+
+    # --------------------------------------------
+    # 3. LSA
+    # Captures broader latent text patterns.
+    # Component count must be smaller than feature count.
+    # --------------------------------------------
+    max_components = min(
+        CONFIG["lsa_components"],
+        ref_word_vec.shape[0] - 1,
+        ref_word_vec.shape[1] - 1
+    )
+
+    if max_components >= 2:
+        lsa = make_pipeline(
+            TruncatedSVD(n_components=max_components, random_state=42),
+            Normalizer(copy=False)
+        )
+
+        ref_lsa_vec = lsa.fit_transform(ref_word_vec)
+        rand_lsa_vec = lsa.transform(rand_word_vec)
+
+        lsa_sim = cosine_similarity(rand_lsa_vec, ref_lsa_vec)
+    else:
+        logging.warning("Not enough data/features for LSA. Using zero LSA similarity.")
+        lsa_sim = word_sim * 0
+
+    # --------------------------------------------
+    # 4. FINAL COMBINED SIMILARITY
+    # Still unsupervised: these are fixed weights,
+    # not learned weights.
+    # --------------------------------------------
+    final_sim = (
+        CONFIG["word_weight"] * word_sim
+        + CONFIG["char_weight"] * char_sim
+        + CONFIG["lsa_weight"] * lsa_sim
+    )
+
+    # --------------------------------------------
+    # 5. KNN CANDIDATE SEARCH
+    # KNN is used to identify candidate matches.
+    # The final ranking uses combined similarity.
+    # --------------------------------------------
+    n_neighbors = min(CONFIG["top_k"], len(reference_clean))
+
+    knn = NearestNeighbors(
+        n_neighbors=n_neighbors,
+        metric="cosine"
+    )
+
+    knn.fit(ref_word_vec)
+
+    _, knn_indices = knn.kneighbors(rand_word_vec)
+
+    results = []
+
+    for i, metric in enumerate(df["random_metrics"]):
+        candidate_indices = knn_indices[i]
+
+        # Rank KNN candidates using the final combined score.
+        ranked_indices = sorted(
+            candidate_indices,
+            key=lambda idx: final_sim[i][idx],
+            reverse=True
+        )
+
+        row = {
+            "random_metric": metric
+        }
+
+        for rank, idx in enumerate(ranked_indices, start=1):
+            row[f"candidate_{rank}"] = df["reference_metrics"].iloc[idx]
+            row[f"score_{rank}"] = round(final_sim[i][idx] * 100, 2)
+            row[f"word_score_{rank}"] = round(word_sim[i][idx] * 100, 2)
+            row[f"char_score_{rank}"] = round(char_sim[i][idx] * 100, 2)
+            row[f"lsa_score_{rank}"] = round(lsa_sim[i][idx] * 100, 2)
+
+        best_score = row["score_1"]
+
+        row["final_match"] = row["candidate_1"]
+        row["final_score"] = best_score
+        row["confidence"] = get_confidence(best_score)
+        row["review_needed"] = best_score < CONFIG["review_threshold"]
+
+        results.append(row)
+
+    output = pd.DataFrame(results)
+
+    logging.info("Metric matching completed successfully.")
+
+    return output
+
+results = match_metrics_with_lsa_knn(df)
+
+print(results.head())

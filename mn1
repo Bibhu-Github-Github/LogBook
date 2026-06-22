@@ -1,0 +1,98 @@
+import re
+from collections import Counter
+
+# Common/filler words to exclude (stop words)
+STOP_WORDS = {
+    'a', 'an', 'the', 'of', 'in', 'at', 'to', 'for', 'and', 'or', 'but',
+    'is', 'are', 'was', 'were', 'be', 'been', 'by', 'on', 'with', 'as',
+    'from', 'that', 'this', 'it', 'its', 'into', 'than', 'then', 'number',
+    'total', 'per', 'very', 'high', 'low', 'percentage', 'amount', 'rate',
+    'level', 'value', 'over', 'under', 'above', 'below', 'across', 'within'
+}
+
+def get_unique_initials(metric_name: str, all_metrics: list) -> str:
+    """
+    Pick the 3 most unique/meaningful words from the metric name
+    by avoiding stop words and words that appear in many other metrics.
+    """
+    words = metric_name.strip().split()
+
+    # Step 1: Remove stop words
+    filtered = [w for w in words if w.lower() not in STOP_WORDS]
+
+    # Step 2: Score words by how rarely they appear across all metrics
+    # Words that appear in fewer metrics are more unique/distinctive
+    all_words_lower = []
+    for m in all_metrics:
+        all_words_lower.extend(m.lower().split())
+    word_freq = Counter(all_words_lower)
+
+    # Step 3: Sort filtered words by frequency (rarest first = most unique)
+    filtered_sorted = sorted(filtered, key=lambda w: word_freq[w.lower()])
+
+    # Step 4: Take top 3 most unique, preserve original order for readability
+    top3 = filtered_sorted[:3]
+    # Re-sort by original position to keep initials in natural word order
+    top3_ordered = sorted(top3, key=lambda w: words.index(w))
+
+    # Step 5: Take first letter of each, pad with X if fewer than 3 words
+    initials = ''.join(w[0].upper() for w in top3_ordered)
+    return initials[:3].ljust(3, 'X')
+
+
+def generate_metric_id(entity: str, metric_name: str, serial: int, all_metrics: list) -> str:
+    """
+    Fixed-length Metric ID: 4 (Entity) + 3 (Initials) + 3 (Serial) = 10 chars
+    """
+    entity_code = entity.upper().ljust(4)[:4]
+    initials_code = get_unique_initials(metric_name, all_metrics)
+    serial_str = str(serial).zfill(3)
+
+    metric_id = f"{entity_code}{initials_code}{serial_str}"
+    assert len(metric_id) == 10, f"ID length error: {metric_id}"
+    return metric_id
+
+
+def check_duplicates(ids: list) -> list:
+    """Warn if any generated IDs clash."""
+    seen = {}
+    dupes = []
+    for mid, name in ids:
+        if mid in seen:
+            dupes.append((mid, seen[mid], name))
+        seen[mid] = name
+    return dupes
+
+
+# --- Your Insurance Metrics ---
+metrics = [
+    "Monthly Liquidity Ratio",
+    "Capital Sufficiency",
+    "Total Operational Risk Losses",
+    "Percentage Exits Ring Fencing Processing",
+    "Regulatory Bank Attributable Sanctions Breaches",
+    "Very High Residual FCC Risks Helios",
+    "Conduct Risk Outcome",
+]
+
+entity = "INBB"
+
+print(f"{'Metric ID':<15} {'Initials':<10} {'Metric Name'}")
+print("-" * 75)
+
+generated = []
+for i, metric in enumerate(metrics, start=1):
+    metric_id = generate_metric_id(entity, metric, i, metrics)
+    initials = get_unique_initials(metric, metrics)
+    print(f"{metric_id:<15} {initials:<10} {metric}")
+    generated.append((metric_id, metric))
+
+# Duplicate check
+dupes = check_duplicates(generated)
+if dupes:
+    print("\n⚠️  DUPLICATE IDs DETECTED:")
+    for mid, m1, m2 in dupes:
+
+        print(f"  {mid} → '{m1}' and '{m2}'")
+else:
+    print("\n✅ All Metric IDs are unique!")

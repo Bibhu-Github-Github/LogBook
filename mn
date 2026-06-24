@@ -1,8 +1,6 @@
-
 import re
 from collections import Counter
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 # ── STOP WORDS: common/filler words to ignore when picking initials ────────────
 STOP_WORDS = {
@@ -15,7 +13,7 @@ STOP_WORDS = {
     'basis', 'cases', 'total'
 }
 
-# ── MUST INCLUDE WORDS: domain-specific words that must never be skipped ───────
+# ── MUST INCLUDE WORDS: domain words that must never be skipped ────────────────
 MUST_INCLUDE_WORDS = {
     'operational', 'risk', 'liquidity', 'capital', 'regulatory', 'conduct',
     'sanctions', 'compliance', 'credit', 'market', 'financial', 'insurance',
@@ -28,32 +26,30 @@ MUST_INCLUDE_WORDS = {
 
 
 def clean_text(text):
-    # Remove all special characters: brackets, #, /, -, >, &, %, etc.
-    # Keep only letters and spaces
+    # Remove all special characters, keep only letters and spaces
     return re.sub(r'[^a-zA-Z\s]', '', str(text)).strip()
 
 
 def get_unique_initials(metric_name, all_metrics_for_entity):
-    # Clean the metric name before processing
+    # Clean the metric name first
     cleaned_name = clean_text(metric_name)
     words = cleaned_name.split()
 
-    # Separate words into must-include vs optional (excluding stop words)
+    # Split words into must-include and optional groups
     must_have = [w for w in words if w.lower() in MUST_INCLUDE_WORDS]
     optional  = [w for w in words if w.lower() not in STOP_WORDS
                                   and w.lower() not in MUST_INCLUDE_WORDS]
 
-    # Score each word by how rarely it appears across all metrics of same entity
-    # Rarer word = more unique = higher priority
+    # Count word frequency across all metrics of same entity
     all_words_lower = []
     for m in all_metrics_for_entity:
         all_words_lower.extend(clean_text(m).lower().split())
     word_freq = Counter(all_words_lower)
 
-    # Sort optional words by frequency ascending (rarest first)
+    # Sort optional words by rarity — rarest word = most unique
     optional_sorted = sorted(optional, key=lambda w: word_freq[w.lower()])
 
-    # Fill 3 slots: must-include words first, then rarest optional words
+    # Fill 3 slots: must-include words first, then rarest optional
     selected = must_have[:3]
     for w in optional_sorted:
         if len(selected) >= 3:
@@ -61,209 +57,110 @@ def get_unique_initials(metric_name, all_metrics_for_entity):
         if w not in selected:
             selected.append(w)
 
-    # Restore natural word order so initials read left to right
+    # Restore natural left-to-right word order
     selected_ordered = sorted(selected, key=lambda w: words.index(w))
 
-    # Take first letter of each selected word, uppercase
+    # Take first letter of each, pad with X if fewer than 3 words
     initials = ''.join(w[0].upper() for w in selected_ordered)
-
-    # Always return exactly 3 chars — pad with X if fewer than 3 words found
     return initials[:3].ljust(3, 'X')
 
 
-def generate_metric_id(entity, metric_name, serial, all_metrics_for_entity):
-    # Clean entity: remove special chars, uppercase, enforce exactly 4 chars
-    entity_code = re.sub(r'[^a-zA-Z0-9]', '', entity).upper().ljust(4)[:4]
-
-    # Get 3-char initials from metric name
+def generate_metric_id(entity_code, metric_name, serial, all_metrics_for_entity):
+    # entity_code is already cleaned 4-char code passed in
     initials_code = get_unique_initials(metric_name, all_metrics_for_entity)
 
-    # Serial resets per entity, zero-padded to 3 digits e.g. 001, 002 ... 999
+    # Zero-pad serial to 3 digits, resets per entity
     serial_str = str(serial).zfill(3)
 
-    # Final ID is always exactly 10 characters
+    # Always exactly 10 characters
     metric_id = f"{entity_code}{initials_code}{serial_str}"
-
-    # Safety check to guarantee fixed length
     assert len(metric_id) == 10, f"ID length error: {metric_id}"
-
     return metric_id
 
 
-def check_duplicates(id_list):
-    # Detect if two different metrics produced the same ID within same entity
-    seen  = {}
-    dupes = []
-    for mid, name in id_list:
-        if mid in seen:
-            dupes.append((mid, seen[mid], name))
-        seen[mid] = name
-    return dupes
-
-
 def process_excel(input_file, output_file):
-    # Load the input Excel workbook
-    wb_in  = openpyxl.load_workbook(input_file)
-    ws_in  = wb_in.active
+    # Load the existing workbook preserving all formatting
+    wb = openpyxl.load_workbook(input_file)
+    ws = wb.active
 
-    # Read header row to find column positions dynamically
-    headers = {}
-    for col in ws_in[1]:
-        if col.value:
-            headers[col.value.strip()] = col.column - 1  # 0-based index
+    # ── Find which column contains "Metric ID" in header row ──────────────────
+    # This avoids hardcoding column number — works even if columns shift
+    metric_id_col = None
+    entity_col    = None
+    metrics_col   = None
 
-    # Find the Metrics and Entity columns (adjust these names to match your file)
-    # Expected headers: Entity, L1 Risk, Metric Category, Metrics, Warning Trigger,
-    #                   Tolerance Threshold, Data Type, Metric ID
+    for cell in ws[1]:
+        if cell.value and 'metric id' in str(cell.value).lower():
+            metric_id_col = cell.column
+        if cell.value and str(cell.value).strip().lower() == 'entity':
+            entity_col = cell.column
+        if cell.value and str(cell.value).strip().lower() == 'metrics':
+            metrics_col = cell.column
+
+    print(f"Entity col: {entity_col}, Metrics col: {metrics_col}, Metric ID col: {metric_id_col}")
+
+    if not all([metric_id_col, entity_col, metrics_col]):
+        raise ValueError("Could not find required columns. Check header names: Entity, Metrics, Metric ID")
+
+    # ── Read all data rows — skip header row 1 ────────────────────────────────
     all_rows = []
-    for row in ws_in.iter_rows(min_row=2, values_only=True):
-        # Skip completely empty rows
+    for row in ws.iter_rows(min_row=2, values_only=True):
         if not any(row):
             continue
-        all_rows.append(list(row))
+        all_rows.append(row)
 
-    # ── Group metrics by entity for per-entity uniqueness scoring ─────────────
-    # Key: entity_code (4 chars), Value: list of metric names
+    # ── Extract entity code from the INBB column (col B in your file) ─────────
+    # Your entity column A has full name like "Insurance PINB_Risk..."
+    # Column B has the actual short entity code "INBB" — use that instead
+    # We find whichever column has short codes like INBB (col index for "L1 Risk" neighbour)
+    # Based on your file: column B = short entity code (INBB)
+    # So we use column index 1 (0-based) which is column B
+
+    # ── Group metric names by entity code for uniqueness scoring ──────────────
     entity_metrics_map = {}
     for row in all_rows:
-        entity = re.sub(r'[^a-zA-Z0-9]', '', str(row[0])).upper()[:4]
-        metric = str(row[3]) if row[3] else ''
-        entity_metrics_map.setdefault(entity, []).append(metric)
+        # Column B (index 1) has the short entity code e.g. INBB
+        raw_entity  = str(row[entity_col - 1]) if row[entity_col - 1] else ''
+        entity_code = re.sub(r'[^a-zA-Z0-9]', '', raw_entity).upper()[:4]
+        metric_name = str(row[metrics_col - 1]) if row[metrics_col - 1] else ''
+        entity_metrics_map.setdefault(entity_code, []).append(metric_name)
 
-    # ── Generate Metric IDs with serial resetting per entity ──────────────────
-    entity_serial_counter = {}  # tracks current serial number per entity
-    results  = []
-    id_check = []
+    # ── Generate and write Metric ID directly into existing column ─────────────
+    entity_serial_counter = {}  # serial resets per entity
 
-    for row in all_rows:
-        entity      = str(row[0]) if row[0] else ''
-        metric_name = str(row[3]) if row[3] else ''
+    for i, row in enumerate(ws.iter_rows(min_row=2), start=2):
+        # Skip empty rows
+        if not any(cell.value for cell in row):
+            continue
 
-        # Clean and encode entity to 4 chars
-        entity_code = re.sub(r'[^a-zA-Z0-9]', '', entity).upper().ljust(4)[:4]
+        # Get entity code from column B (short code like INBB)
+        raw_entity  = str(ws.cell(i, entity_col).value or '')
+        entity_code = re.sub(r'[^a-zA-Z0-9]', '', raw_entity).upper()[:4]
 
-        # Increment serial for this entity (starts at 1, resets per new entity)
+        # Get metric name
+        metric_name = str(ws.cell(i, metrics_col).value or '')
+
+        # Increment serial for this entity — resets to 001 for each new entity
         entity_serial_counter[entity_code] = entity_serial_counter.get(entity_code, 0) + 1
         serial = entity_serial_counter[entity_code]
 
-        # Get all metrics belonging to this entity for uniqueness scoring
+        # Get all metrics for this entity
         all_metrics_for_entity = entity_metrics_map.get(entity_code, [])
 
         # Generate the Metric ID
-        metric_id = generate_metric_id(entity, metric_name, serial, all_metrics_for_entity)
+        metric_id = generate_metric_id(entity_code, metric_name, serial, all_metrics_for_entity)
 
-        # Append generated ID to the row
-        updated_row = row + (metric_id,)
-        results.append(updated_row)
-        id_check.append((metric_id, metric_name))
+        # Write ONLY into the existing Metric ID column — no new columns created
+        ws.cell(row=i, column=metric_id_col).value = metric_id
 
-    # ── Check for duplicate IDs across all entities ────────────────────────────
-    dupes = check_duplicates(id_check)
+        print(f"Row {i}: {entity_code} | {metric_name[:40]:<40} | {metric_id}")
 
-    # ── Build output Excel with populated Metric ID column ────────────────────
-    wb_out = openpyxl.Workbook()
-    ws_out = wb_out.active
-    ws_out.title = "Board Metrics"
-
-    # Define styles
-    hdr_font   = Font(name='Calibri', bold=True, color='FFFFFF', size=11)
-    hdr_fill   = PatternFill('solid', start_color='E26B0A')
-    cell_font  = Font(name='Calibri', size=10)
-    id_font    = Font(name='Calibri', size=10, bold=True, color='FFFFFF')
-    id_fill    = PatternFill('solid', start_color='375623')
-    alt_fill   = PatternFill('solid', start_color='F2F2F2')
-    center     = Alignment(horizontal='center', vertical='center', wrap_text=True)
-    left       = Alignment(horizontal='left',   vertical='center', wrap_text=True)
-    thin       = Border(
-        left=Side(style='thin'), right=Side(style='thin'),
-        top=Side(style='thin'),  bottom=Side(style='thin')
-    )
-
-    # Write header row — original headers + new Metric ID column
-    out_headers    = ['Entity', 'L1 Risk', 'Metric Category', 'Metrics',
-                      'Warning Trigger', 'Tolerance Threshold', 'Data Type', 'Metric ID']
-    col_widths     = [8, 22, 16, 45, 30, 25, 12, 14]
-
-    for col, (h, w) in enumerate(zip(out_headers, col_widths), 1):
-        cell            = ws_out.cell(row=1, column=col, value=h)
-        cell.font       = hdr_font
-        cell.fill       = hdr_fill
-        cell.alignment  = center
-        cell.border     = thin
-        ws_out.column_dimensions[cell.column_letter].width = w
-    ws_out.row_dimensions[1].height = 30
-
-    # Write data rows
-    for i, row in enumerate(results, start=2):
-        for col, value in enumerate(row, 1):
-            cell           = ws_out.cell(row=i, column=col, value=value)
-            cell.border    = thin
-            cell.alignment = left if col == 4 else center
-
-            # Metric ID column: green background, white bold text
-            if col == len(row):
-                cell.font = id_font
-                cell.fill = id_fill
-            else:
-                cell.font = cell_font
-                cell.fill = alt_fill if i % 2 == 0 else PatternFill()
-
-        ws_out.row_dimensions[i].height = 40
-
-    # Freeze the header row so it stays visible when scrolling
-    ws_out.freeze_panes = 'A2'
-
-    # ── Add a second sheet explaining the ID logic ─────────────────────────────
-    ws2 = wb_out.create_sheet("ID Logic")
-    logic = [
-        ("Rule",           "Detail"),
-        ("Format",         "ENTITY(4) + INITIALS(3) + SERIAL(3) = 10 chars fixed"),
-        ("Entity",         "First 4 chars of entity name, uppercase, no special chars"),
-        ("Initials",       "3 most unique/meaningful words from metric name"),
-        ("Serial",         "3-digit zero-padded, resets to 001 for each new entity"),
-        ("Stop Words",     "Generic words excluded: a, the, of, in, total, number..."),
-        ("Must-Include",   "Key words always prioritised: risk, operational, fcc..."),
-        ("Special Chars",  "All removed before processing: () # / - > & % etc."),
-        ("Padding",        "Initials padded with X if fewer than 3 meaningful words"),
-        ("Duplicate Check","Warns in console if two metrics generate same ID"),
-    ]
-    for r, (k, v) in enumerate(logic, 1):
-        ws2.cell(r, 1, k).font = Font(bold=True, name='Calibri')
-        ws2.cell(r, 2, v).font = Font(name='Calibri')
-    ws2.column_dimensions['A'].width = 20
-    ws2.column_dimensions['B'].width = 65
-
-    # Save the output file
-    wb_out.save(output_file)
-
-    # ── Print summary to console ───────────────────────────────────────────────
-    print(f"\n{'Metric ID':<14} {'Init':<6} {'Serial':<8} Metric Name")
-    print("-" * 80)
-    prev_entity = None
-    temp_counter = {}
-    for row in results:
-        entity_code = re.sub(r'[^a-zA-Z0-9]', '', str(row[0])).upper()[:4]
-        metric_id   = row[-1]
-        metric_name = str(row[3])[:50]
-        initials    = metric_id[4:7]
-        serial      = metric_id[7:]
-        if entity_code != prev_entity:
-            print(f"\n  Entity: {entity_code}  — serial resets to 001")
-            prev_entity = entity_code
-        print(f"  {metric_id:<14} {initials:<6} {serial:<8} {metric_name}")
-
-    if dupes:
-        print("\n⚠️  DUPLICATE IDs DETECTED:")
-        for mid, m1, m2 in dupes:
-            print(f"  {mid} -> '{m1}' | '{m2}'")
-    else:
-        print("\n✅ All Metric IDs are unique!")
-
-    print(f"\n✅ Output saved to: {output_file}\n")
+    # Save to output file — original file untouched
+    wb.save(output_file)
+    print(f"\n✅ Done! Saved to: {output_file}")
 
 
-# ── ENTRY POINT: change these paths to match your files ───────────────────────
-if _name_ == "_main_":
-    INPUT_FILE  = "your_input_file.xlsx"   # <- replace with your actual input file path
-    OUTPUT_FILE = "metric_ids_output.xlsx" # <- replace with your desired output path
-    process_excel(INPUT_FILE, OUTPUT_FILE)
+# ── Replace with your actual file paths ───────────────────────────────────────
+INPUT_FILE  = "your_input_file.xlsx"
+OUTPUT_FILE = "your_output_file.xlsx"
+process_excel(INPUT_FILE, OUTPUT_FILE
